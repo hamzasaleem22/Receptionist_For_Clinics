@@ -13,6 +13,7 @@ from livekit.agents import (
     JobProcess,
     TurnHandlingOptions,
     inference,
+    llm,
     room_io,
 )
 from livekit.agents.beta.tools import EndCallTool
@@ -20,14 +21,97 @@ from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from cal_tools import CalToolset
+from database import Database
+from memory_tools import PatientToolset
 
 load_dotenv(".env.local")
 
 cal_tools = CalToolset()
 
 
+async def _get_caller_phone(ctx: agents.JobContext) -> str | None:
+    try:
+        participant = room_io.linked_participant(ctx.room)
+        if participant and participant.attributes:
+            phone = participant.attributes.get("sip.caller")
+            if phone:
+                return phone
+        return None
+    except Exception:
+        return None
+
+
+async def preload_user_context(
+    phone: str | None, db: Database
+) -> tuple[llm.ChatContext, dict | None]:
+    chat_ctx = llm.ChatContext()
+
+    if not phone:
+        chat_ctx.add_message(
+            role="assistant",
+            content="No caller ID available. This caller is unknown — greet them as a new patient and ask for their name and phone number.",
+        )
+        return chat_ctx, None
+
+    patient_doc = await db.find_patient_by_phone(phone)
+
+    if not patient_doc:
+        chat_ctx.add_message(
+            role="assistant",
+            content="This phone number is not in our records. Greet the caller as a new patient and ask for their name to create a record.",
+        )
+        return chat_ctx, None
+
+    context_parts = [
+        f"Returning patient: {patient_doc['first_name']} {patient_doc['last_name']} (ID: {patient_doc['patient_id']})."
+    ]
+
+    bookings = patient_doc.get("bookings", [])
+    sorted_bookings = sorted(
+        bookings, key=lambda b: b.get("created_at", datetime.min), reverse=True
+    )[:3]
+    if sorted_bookings:
+        lines = []
+        for b in sorted_bookings:
+            time_str = b["start_time"].strftime("%A %B %d at %I:%M %p")
+            lines.append(
+                f"- {b['event_type_slug']} on {time_str} (Status: {b['status']})"
+            )
+        context_parts.append("Their recent bookings:\n" + "\n".join(lines))
+
+    summaries = patient_doc.get("conversation_summaries", [])
+    sorted_summaries = sorted(
+        summaries, key=lambda s: s.get("created_at", datetime.min), reverse=True
+    )
+    if sorted_summaries:
+        context_parts.append(
+            f"Summary of their last call:\n{sorted_summaries[0]['summary']}"
+        )
+
+    memories = patient_doc.get("memories", [])
+    sorted_memories = sorted(
+        memories, key=lambda m: m.get("updated_at", datetime.min), reverse=True
+    )
+    if sorted_memories:
+        lines = [f"- {m['key']}: {m['value']}" for m in sorted_memories]
+        context_parts.append("Remembered facts about this patient:\n" + "\n".join(lines))
+
+    chat_ctx.add_message(role="assistant", content="\n\n".join(context_parts))
+    return chat_ctx, patient_doc
+
+
 class Assistant(Agent):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        chat_ctx: llm.ChatContext | None = None,
+        patient_id: str | None = None,
+        db: Database | None = None,
+    ) -> None:
+        self._patient_id = patient_id
+        self._db = db
+        self._preloaded_ctx = chat_ctx
+        self._patient_tools = PatientToolset(db=db, patient_id=patient_id, cal_tools=cal_tools) if db else None
         end_call = EndCallTool()
         _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         super().__init__(
@@ -70,7 +154,9 @@ Real examples of how you must talk:
 - Default to a calm, warm tone.
 
 ## Conversation flow
-**Greeting:** Start with "Hi, Jassey speaking, Alfalha Hospital receptionist. I can help you with booking appointments, cancellations, or rescheduling — how can I assist you today?" Keep it simple. Do NOT list the appointment types unless the caller specifically asks what types are available.
+**Greeting — returning vs new caller:**
+- If you know the patient's name from the preloaded context, greet them by name: "Hi {{name}}, Jassey speaking, Alfalha Hospital receptionist — how can I help you today?"
+- If the caller is unknown or no caller ID is available, start with: "Hi, Jassey speaking, Alfalha Hospital receptionist. I can help you with booking appointments, cancellations, or rescheduling — how can I assist you today?"
 
 **Adaptive flow — answer first, collect details later:**
 - There is NO fixed step sequence. Let the customer lead. Answer their question immediately.
@@ -83,7 +169,14 @@ Real examples of how you must talk:
 - For reschedule: ask for the UID and preferred new time.
 - Keep it conversational. No rigid scripts.
 
-## Tools
+## Patient Memory Tools
+- `create_patient_record(first_name, last_name, phone)` — Create a new patient record. Call this when a new patient gives you their name. Sets the patient ID for the rest of the call.
+- `remember_fact(key, value)` — Store a fact about the patient (e.g. preferred time, allergies). Overwrites if the same key exists.
+- `recall_fact(key)` — Retrieve a specific fact by label.
+- `list_facts()` — Show all stored facts about this patient.
+- `forget_fact(key)` — Remove a specific fact.
+
+## Booking Tools
 - `list_event_types()` — Show all appointment types.
 - `check_availability(event_type_slug, date)` — Check slots for a specific appointment type on a given date.
 - `create_booking(event_type_slug, start_time, attendee_name, attendee_email, attendee_timezone, attendee_phone, notes)` — Book an appointment. Only call AFTER reading details back and patient confirmed.
@@ -107,21 +200,52 @@ Available appointment types (slug shown in parentheses):
 - **Only speak facts from tool results.** Never invent availability slots, booking confirmations, or any data.
 - **Never confirm an action you haven't completed.** Don't say "I've booked" until `create_booking` returns success.
 - **If uncertain about what the patient said, ask for clarification.** Don't guess names, dates, or times.
-- **Stay in scope.** You handle appointments only. For medical advice or billing, say you can only help with appointments.
+- **Stay in scope.** You handle appointments only. For medical advice or billing, you can only help with appointments.
 - **Be honest about limitations.** If you don't know something, say so — don't make it up.
 
 Today's date: {_today}.""",
-            tools=[*end_call.tools, cal_tools],
+            chat_ctx=chat_ctx,
+            tools=[*end_call.tools, cal_tools, self._patient_tools] if self._patient_tools else [*end_call.tools, cal_tools],
         )
 
     async def on_enter(self) -> None:
         self.session.userdata = {}
-        await self.session.generate_reply(
-            instructions="Greet the caller warmly as a receptionist from Alfalha Hospital and offer your assistance."
-        )
+        if self._patient_id:
+            await self.session.generate_reply(
+                instructions="Greet the returning caller warmly by name using the preloaded context."
+            )
+        else:
+            await self.session.generate_reply(
+                instructions="Greet the caller warmly as a receptionist from Alfalha Hospital and offer your assistance."
+            )
 
     async def on_exit(self) -> None:
-        pass
+        pid = self._patient_id
+        if not pid and self._patient_tools:
+            pid = self._patient_tools._patient_id
+        if not pid or not self._db:
+            return
+
+        try:
+            chat_ctx = self.session.chat_ctx
+            if not chat_ctx or not chat_ctx.messages:
+                return
+
+            summary_ctx = llm.ChatContext()
+            summary_ctx.add_message(
+                role="system",
+                content="Summarize this phone conversation in 2-3 sentences. Focus on what the patient needed, what was booked/cancelled/rescheduled, and any important details.",
+            )
+            for m in chat_ctx.messages:
+                summary_ctx.add_message(role=m.role, content=m.content)
+
+            llm_instance = inference.LLM(model="openai/gpt-4o")
+            stream = llm_instance.chat(chat_ctx=summary_ctx)
+            result = await stream.collect()
+            if result and result.text:
+                await self._db.add_summary(pid, result.text)
+        except Exception:
+            pass
 
 
 def _prewarm(proc: JobProcess) -> None:
@@ -133,7 +257,19 @@ server = AgentServer(setup_fnc=_prewarm)
 
 @server.rtc_session(agent_name="Clinics Receptionist")
 async def my_agent(ctx: agents.JobContext):
+    db = Database()
+    await db.ensure_indexes()
     await cal_tools.sync_event_type_names()
+
+    caller_phone = await _get_caller_phone(ctx)
+    initial_ctx, patient_doc = await preload_user_context(caller_phone, db)
+    patient_id = patient_doc["patient_id"] if patient_doc else None
+    cal_tools.set_patient_context(db, patient_id)
+
+    async def _shutdown() -> None:
+        await db.close()
+
+    ctx.add_shutdown_callback(_shutdown)
 
     session = AgentSession(
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
@@ -160,7 +296,7 @@ async def my_agent(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=Assistant(),
+        agent=Assistant(chat_ctx=initial_ctx, patient_id=patient_id, db=db),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=ai_coustics.audio_enhancement(

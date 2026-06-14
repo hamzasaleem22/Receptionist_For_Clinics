@@ -12,6 +12,8 @@ import httpx
 from livekit.agents import llm
 from livekit.agents.llm.tool_context import ToolError
 
+from database import Database
+
 CAL_API_BASE = "https://api.cal.com/v2"
 CAL_API_VERSION = "2026-02-25"
 HTTP_TIMEOUT = 15
@@ -55,6 +57,15 @@ class CalToolset(llm.Toolset):
             raise RuntimeError("CAL_API_KEY not set in environment")
         self._api_key = api_key
         self._username = os.environ.get("CAL_USERNAME", "hamzii-salim-4xxmhu")
+        self._db: Database | None = None
+        self._patient_id: str | None = None
+
+    def set_patient_context(self, db: Database, patient_id: str | None) -> None:
+        self._db = db
+        self._patient_id = patient_id
+
+    def update_patient_id(self, patient_id: str) -> None:
+        self._patient_id = patient_id
 
     async def _request(
         self,
@@ -205,6 +216,21 @@ class CalToolset(llm.Toolset):
         uid = booking.get("uid", "unknown")
         start = booking.get("start", start_time)
 
+        if self._db and self._patient_id:
+            try:
+                start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            except ValueError:
+                start_dt = datetime.now(timezone.utc)
+            await self._db.add_booking(
+                patient_id=self._patient_id,
+                cal_booking_uid=uid,
+                event_type_slug=event_type_slug,
+                start_time=start_dt,
+                attendee_name=attendee_name,
+                attendee_email=resolved_email,
+                attendee_timezone=attendee_timezone,
+            )
+
         return (
             f"Appointment booked successfully!\n"
             f"Booking UID: {uid}\n"
@@ -235,6 +261,10 @@ class CalToolset(llm.Toolset):
 
         booking = data.get("data", {})
         new_start_val = booking.get("start", new_start)
+
+        if self._db:
+            await self._db.update_booking_status(booking_uid, "rescheduled")
+
         return f"Booking rescheduled successfully! New time: {new_start_val}"
 
     @llm.function_tool
@@ -254,6 +284,9 @@ class CalToolset(llm.Toolset):
             body["cancellationReason"] = reason
 
         data = await self._post(f"/bookings/{booking_uid}/cancel", body=body)
+
+        if self._db:
+            await self._db.update_booking_status(booking_uid, "cancelled")
 
         return "Booking cancelled successfully."
 
