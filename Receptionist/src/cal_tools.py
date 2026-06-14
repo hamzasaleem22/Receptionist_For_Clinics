@@ -12,8 +12,6 @@ import httpx
 from livekit.agents import llm
 from livekit.agents.llm.tool_context import ToolError
 
-from database import Database
-
 CAL_API_BASE = "https://api.cal.com/v2"
 CAL_API_VERSION = "2026-02-25"
 HTTP_TIMEOUT = 15
@@ -50,14 +48,13 @@ def _set_cached_slots(event_type_slug: str, date: str, slots: list) -> None:
 
 
 class CalToolset(llm.Toolset):
-    def __init__(self, db: Database) -> None:
+    def __init__(self) -> None:
         super().__init__(id="cal")
         api_key = os.environ.get("CAL_API_KEY")
         if not api_key:
             raise RuntimeError("CAL_API_KEY not set in environment")
         self._api_key = api_key
         self._username = os.environ.get("CAL_USERNAME", "hamzii-salim-4xxmhu")
-        self._db = db
 
     async def _request(
         self,
@@ -127,17 +124,18 @@ class CalToolset(llm.Toolset):
     @llm.function_tool
     async def check_availability(
         self,
-        event_type_slug: Annotated[str, "Slug of the event type to check (e.g. 'checkup', 'follow-up', 'new-patient')"],
-        date: Annotated[str, "Date in YYYY-MM-DD format"],
+        event_type_slug: Annotated[str, "Slug of the event type to check. Options: '30min' (General Consultation), 'checkup' (Routine Checkup), 'follow-up' (Follow-up), 'secret' (Urgent), 'new-patient' (New Patient Registration)."],
+        date: Annotated[str, "Date in YYYY-MM-DD format. Defaults to today if not provided."] | None = None,
         timezone: Annotated[str, "IANA timezone, e.g. 'Asia/Karachi'"] = "Asia/Karachi",
     ) -> str:
         """Check available time slots for a specific appointment type on a given date.
 
         Args:
-            event_type_slug: The slug of the event type (e.g. 'checkup', 'follow-up').
-            date: The date to check availability for, in YYYY-MM-DD format.
+            event_type_slug: The slug of the event type.
+            date: The date to check availability for, in YYYY-MM-DD format. Defaults to today.
             timezone: IANA timezone for slot display (default Asia/Karachi).
         """
+        date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cached = _get_cached_slots(event_type_slug, date)
         if cached is not None:
             slots = cached
@@ -157,51 +155,11 @@ class CalToolset(llm.Toolset):
             return f"No available slots on {date} for {event_type_slug}."
 
         times = [s["start"] for s in slots]
-        formatted = "\n".join(f"  {i+1}. {_format_time(t)}" for i, t in enumerate(times))
-        return f"Available slots on {date} ({event_type_slug}):\n{formatted}"
+        first = _format_time(times[0])
+        last = _format_time(times[-1])
+        return f"Slots on {date}: {first} to {last}, {len(times)} time(s) available."
 
-    @llm.function_tool
-    async def check_availability_bulk(
-        self,
-        event_type_slugs: Annotated[list[str], "List of event type slugs to check (e.g. ['checkup', '30min', 'follow-up', 'secret', 'new-patient'])"],
-        date: Annotated[str, "Date in YYYY-MM-DD format"],
-        timezone: Annotated[str, "IANA timezone, e.g. 'Asia/Karachi'"] = "Asia/Karachi",
-    ) -> str:
-        """Check available time slots for multiple appointment types on a given date at once.
 
-        Use this instead of calling check_availability multiple times when the patient doesn't
-        have a preference yet or wants to see all available options.
-
-        Args:
-            event_type_slugs: List of slugs to check (e.g. ['checkup', '30min']).
-            date: The date to check availability for, in YYYY-MM-DD format.
-            timezone: IANA timezone for slot display (default Asia/Karachi).
-        """
-        lines = []
-        for slug in event_type_slugs:
-            cached = _get_cached_slots(slug, date)
-            if cached is not None:
-                slots = cached
-            else:
-                params = {
-                    "username": self._username,
-                    "eventTypeSlug": slug,
-                    "start": date,
-                    "end": date,
-                    "timeZone": timezone,
-                }
-                data = await self._get("/slots", params=params, version="2024-09-04")
-                slots = data.get("data", {}).get(date, [])
-                _set_cached_slots(slug, date, slots)
-
-            display = EVENT_TYPE_DISPLAY.get(slug, slug)
-            if not slots:
-                lines.append(f"{display}: No available slots")
-            else:
-                times = [s["start"] for s in slots]
-                formatted = ", ".join(_format_time(t) for t in times[:5])
-                lines.append(f"{display}: {formatted}")
-        return "Available slots:\n" + "\n".join(lines)
 
     @llm.function_tool
     async def create_booking(
@@ -209,7 +167,6 @@ class CalToolset(llm.Toolset):
         event_type_slug: Annotated[str, "Slug of the event type to book (e.g. 'checkup', 'follow-up', 'new-patient')"],
         start_time: Annotated[str, "Start time in ISO 8601 UTC format, e.g. '2024-08-13T09:00:00Z'"],
         attendee_name: str,
-        patient_id: Annotated[str | None, "The patient ID from their patient record. Use only if the patient already has a record or was just created via create_patient_record."] = None,
         attendee_email: Annotated[str | None, "Email address of the patient. Ask for it first. Only omit if the patient truly doesn't have one."] = None,
         attendee_timezone: Annotated[str, "IANA timezone, e.g. 'Asia/Karachi'"] = "Asia/Karachi",
         attendee_phone: Annotated[str | None, "Phone number in international format"] = None,
@@ -221,7 +178,6 @@ class CalToolset(llm.Toolset):
             event_type_slug: The slug of the event type (e.g. 'checkup', 'follow-up').
             start_time: Start time in ISO 8601 UTC format.
             attendee_name: Full name of the patient.
-            patient_id: Patient ID from their record (if known).
             attendee_email: Email address of the patient. Ask first. If unavailable, a placeholder will be used.
             attendee_timezone: IANA timezone of the patient.
             attendee_phone: Phone number in international format (optional).
@@ -248,25 +204,6 @@ class CalToolset(llm.Toolset):
         booking = data.get("data", {})
         uid = booking.get("uid", "unknown")
         start = booking.get("start", start_time)
-
-        if patient_id:
-            try:
-                st = (
-                    datetime.fromisoformat(start.replace("Z", "+00:00"))
-                    if isinstance(start, str) and "Z" in start
-                    else datetime.now(timezone.utc)
-                )
-                await self._db.create_booking(
-                    patient_id=patient_id,
-                    cal_booking_uid=uid,
-                    event_type_slug=event_type_slug,
-                    start_time=st,
-                    attendee_name=attendee_name,
-                    attendee_email=resolved_email,
-                    attendee_timezone=attendee_timezone,
-                )
-            except Exception as e:
-                logging.exception("Error saving booking to DB from tool")
 
         return (
             f"Appointment booked successfully!\n"
