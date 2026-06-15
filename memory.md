@@ -12,24 +12,26 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
                                     ↓
                 Voice conversation + MongoDB + Cal.com
                                     ↓
-          Caller identified by phone (SIP) → preload context
+          Caller identified by SIP phone (sip.phoneNumber)
           Memory tools: remember/recall/list/forget facts
           Bookings auto-persisted to MongoDB after Cal.com
-          LLM summary saved on call end
+          Auto-memory (last_booked) stored on booking
+          Structured summary saved on call end
 ```
 
 ---
 
-## Current State — Fully Implemented
+## Current State — Fully Implemented & Fixed
 
 ### Core Agent (`src/agent.py`)
 - **Identity**: "Jassey", warm conversational receptionist
-- **Caller ID**: Extracts `sip.caller` from participant attributes; gracefully falls back to unknown caller in console mode
+- **Caller ID**: Uses `ctx.wait_for_participant()` + `sip.phoneNumber` (LiveKit standard SIP attribute). Phone normalized to digits only. 10s timeout for console fallback.
+- **Phone auto-captured**: Agent never asks caller for phone number — it's extracted automatically from SIP attributes
 - **Preloaded context**: `preload_user_context(phone, db)` fetches patient profile + recent bookings + last conversation summary + memories; injects into `ChatContext` before session starts
 - **Two greeting paths**: returning caller (known phone) greeted by name; unknown caller greeted generically
 - **Patient Memory Tools** section in instructions (create_patient_record, remember_fact, recall_fact, list_facts, forget_fact)
 - **`on_enter()`** branches on `patient_id` for returning-vs-new greeting
-- **`on_exit()`** generates 2-3 sentence LLM summary of the conversation and persists via `db.add_summary()`
+- **`on_exit()`** reads recent booking from DB and saves structured summary via `db.add_summary()` — no dependency on `session.chat_ctx` (which is cleared before on_exit fires)
 - **Cleanup**: `ctx.add_shutdown_callback()` closes MongoDB connection on shutdown
 - Agent name in dispatch: **"Clinics Receptionist"**
 
@@ -41,17 +43,18 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
   - `memories[]` — `{key, value, created_at, updated_at}`
 - **Indexes**: `phone` (unique, sparse), `patient_id` (unique, sparse), `bookings.cal_booking_uid` (unique, partial filter)
 - **CRUD**: find/create/update patient, add/get/update bookings, add/get summaries, remember/recall/list/forget facts
-- All operations use `$push`, `$pull`, positional `$` on embedded arrays — no joins
+- **Duplicate-safe create_patient**: checks existing phone first → updates name → returns existing patient_id. DuplicateKeyError safety net for race conditions
+- All operations use `$push`, `$pull`, positional `$` on embedded arrays
 
 ### Cal.com Integration (`src/cal_tools.py`)
 - 5 event types with retry + caching
 - **DB-aware**: `set_patient_context(db, patient_id)` and `update_patient_id(pid)` methods
-- `create_booking` persists to MongoDB after Cal.com success
+- `create_booking` persists to MongoDB + auto-stores `last_booked` fact in memories
 - `reschedule_booking` / `cancel_booking` update booking status in MongoDB
 
 ### Patient Memory Tools (`src/memory_tools.py`)
 - `PatientToolset` with 5 `@llm.function_tool` methods:
-  - `create_patient_record(first_name, last_name, phone)` — creates patient, syncs `patient_id` to CalToolset
+  - `create_patient_record(first_name, last_name, phone)` — creates or finds patient, syncs `patient_id` to CalToolset
   - `remember_fact(key, value)` — upserts key-value fact in embedded `memories[]`
   - `recall_fact(key)` — retrieves a specific fact
   - `list_facts()` — lists all stored facts
@@ -62,8 +65,23 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
 
 ### Agent Instructions
 - Full LiveKit-recommended prompt structure with guardrails, SSML, returning-vs-new greeting rules
+- Agent never asks for phone number (auto-captured from SIP)
 - Patient Memory Tools section listing all 5 tools
 - Dynamic `{_today}` date
+
+---
+
+## Issues Resolved (2026-06-15)
+
+See `issue.md` and `plan/fix-permanent-memory-issues.md` for full details.
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | Returning caller not recognized | Changed `sip.caller` → `sip.phoneNumber`, use `wait_for_participant()`, normalize phone to digits |
+| 2 | `create_patient_record` crashes on duplicate | Check existing phone first → update name → return existing ID |
+| 3 | `conversation_summaries` always empty | `on_exit` reads recent bookings from DB instead of cleared session chat_ctx |
+| 4 | `memories` always empty | Auto-store `last_booked` fact in `create_booking()` |
+| 5 | Empty `last_name` | `create_patient()` updates existing patient fields when phone matches |
 
 ---
 
@@ -103,7 +121,8 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
 ---
 
 ## Git Branches
-- **Database+Appointments-Done** — current (feature/permanent-memory built on top)
+- **Memory-Successful** — feature/permanent-memory
+- **Memory-Issue-Resolved** — latest: 5 memory bugs fixed
 
 ---
 
@@ -117,7 +136,9 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
 | `src/memory_tools.py` | PatientToolset (create_patient_record, remember/recall/list/forget facts) |
 | `src/models.py` | PatientData dataclass |
 | `start.sh` | Production launch script |
-| `plan.md` | Implementation plan (v2 — single-collection schema) |
+| `issue.md` | Issue analysis — 5 problems found |
+| `plan/fix-permanent-memory-issues.md` | Fix plan + checklist |
+| `plan/feature-permanent-memory-1.md` | Original implementation plan |
 | `.env.local` | All credentials |
 | `pyproject.toml` | Python dependencies |
 
@@ -127,4 +148,7 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
 - All 14 CRUD operations verified against live MongoDB Atlas
 - Console mode (`--text`) — agent starts, connects to LiveKit Inference, session initializes
 - Production mode — agent registers with LiveKit Cloud (India West region)
-- Test patient: Ahmed Hassan (+923001112233) used for DB verification
+- Phone normalization: `+923503070436` → `923503070436`
+- Duplicate-safe patient creation verified
+- Auto-memory `last_booked` stored on booking create
+- Summary saves reliably on call end (no dependency on session state)
