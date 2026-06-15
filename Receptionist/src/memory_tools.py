@@ -26,7 +26,7 @@ class PatientToolset(llm.Toolset):
         last_name: Annotated[str, "Last name of the patient"],
         phone: Annotated[str | None, "Phone number in international format, e.g. +923001234567"] = None,
     ) -> str:
-        """Create a new patient record in the system. Call this when a new caller gives their name.
+        """Create or find a patient record. Call this when a caller gives their name.
 
         Args:
             first_name: The patient's first name.
@@ -37,7 +37,7 @@ class PatientToolset(llm.Toolset):
         self._patient_id = patient_id
         if self._cal_tools and hasattr(self._cal_tools, "update_patient_id"):
             self._cal_tools.update_patient_id(patient_id)
-        return f"Patient record created successfully for {first_name} {last_name} (ID: {patient_id})."
+        return f"Patient record ready for {first_name} {last_name} (ID: {patient_id})."
 
     @llm.function_tool
     async def remember_fact(

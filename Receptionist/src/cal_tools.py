@@ -230,6 +230,11 @@ class CalToolset(llm.Toolset):
                 attendee_email=resolved_email,
                 attendee_timezone=attendee_timezone,
             )
+            await self._db.remember_fact(
+                self._patient_id,
+                "last_booked",
+                f"{EVENT_TYPE_DISPLAY.get(event_type_slug, event_type_slug)} on {start}",
+            )
 
         return (
             f"Appointment booked successfully!\n"

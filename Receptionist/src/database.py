@@ -5,6 +5,8 @@ import random
 import string
 from datetime import datetime, timezone
 
+from pymongo.errors import DuplicateKeyError
+
 from motor.motor_asyncio import AsyncIOMotorClient
 
 DB_NAME = "voice_agent_clinic"
@@ -43,6 +45,15 @@ class Database:
     async def create_patient(
         self, first_name: str, last_name: str, phone: str | None = None
     ) -> str:
+        if phone:
+            existing = await self.find_patient_by_phone(phone)
+            if existing:
+                await self.update_patient(existing["patient_id"], {
+                    "first_name": first_name,
+                    "last_name": last_name,
+                })
+                return existing["patient_id"]
+
         patient_id = await self._generate_patient_id()
         doc = {
             "patient_id": patient_id,
@@ -55,7 +66,14 @@ class Database:
             "conversation_summaries": [],
             "memories": [],
         }
-        await self._patients.insert_one(doc)
+        try:
+            await self._patients.insert_one(doc)
+        except DuplicateKeyError:
+            if phone:
+                existing = await self.find_patient_by_phone(phone)
+                if existing:
+                    return existing["patient_id"]
+            return await self.create_patient(first_name, last_name, phone)
         return patient_id
 
     async def update_patient(self, patient_id: str, updates: dict) -> None:

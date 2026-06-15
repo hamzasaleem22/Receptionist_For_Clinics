@@ -1,8 +1,10 @@
+import asyncio
+import re
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-from livekit import agents
+from livekit import agents, rtc
 from livekit.agents import (
     AgentServer,
     AgentSession,
@@ -29,15 +31,24 @@ load_dotenv(".env.local")
 cal_tools = CalToolset()
 
 
+def normalize_phone(phone: str | None) -> str | None:
+    if not phone:
+        return None
+    return re.sub(r"\D", "", phone)
+
+
 async def _get_caller_phone(ctx: agents.JobContext) -> str | None:
     try:
-        participant = room_io.linked_participant(ctx.room)
-        if participant and participant.attributes:
-            phone = participant.attributes.get("sip.caller")
+        await ctx.connect()
+        participant = await asyncio.wait_for(
+            ctx.wait_for_participant(), timeout=10.0
+        )
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            phone = participant.attributes.get("sip.phoneNumber")
             if phone:
-                return phone
+                return normalize_phone(phone)
         return None
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         return None
 
 
@@ -49,7 +60,7 @@ async def preload_user_context(
     if not phone:
         chat_ctx.add_message(
             role="assistant",
-            content="No caller ID available. This caller is unknown — greet them as a new patient and ask for their name and phone number.",
+            content="No caller ID available. This caller is unknown — greet them as a new patient and ask for their name.",
         )
         return chat_ctx, None
 
@@ -58,7 +69,7 @@ async def preload_user_context(
     if not patient_doc:
         chat_ctx.add_message(
             role="assistant",
-            content="This phone number is not in our records. Greet the caller as a new patient and ask for their name to create a record.",
+            content="This phone number is not in our records. Greet the caller as a new patient and ask for their name to create a record. Their phone number is already captured from the call.",
         )
         return chat_ctx, None
 
@@ -160,17 +171,17 @@ Real examples of how you must talk:
 
 **Adaptive flow — answer first, collect details later:**
 - There is NO fixed step sequence. Let the customer lead. Answer their question immediately.
-- If they ask about availability or slots, check right away without asking for name or phone. Call `check_availability` directly.
+- If they ask about availability or slots, check right away without asking for their name. Call `check_availability` directly.
 - **When the user hasn't specified a type, default to checking General Consultation (`30min`)** — call `check_availability(event_type_slug="30min")`.
 - If the user says "tomorrow" or "next Monday" etc., convert it to the actual date. If no date specified, it defaults to today.
-- Only ask for name, phone, and email when they actually decide to book. Gather them as a natural part of confirming the booking, not before answering their questions.
-- When they want to book, ask for name, phone, and email in that moment — then read back the details and call `create_booking`.
+- Only ask for name and email when they decide to book. Their phone number is automatically captured from the call. Gather them as a natural part of confirming the booking, not before answering their questions.
+- When they want to book, ask for their name and email — then read back the details and call `create_booking`.
 - For cancellation: [sighs] softly before handling it — "I'm sorry to hear that. Let me help you with that." Then ask for the booking UID.
 - For reschedule: ask for the UID and preferred new time.
 - Keep it conversational. No rigid scripts.
 
 ## Patient Memory Tools
-- `create_patient_record(first_name, last_name, phone)` — Create a new patient record. Call this when a new patient gives you their name. Sets the patient ID for the rest of the call.
+- `create_patient_record(first_name, last_name, phone)` — Create a new patient record. Call this when a new patient gives you their name. Phone number is optional — it's auto-captured from the call. Sets the patient ID for the rest of the call.
 - `remember_fact(key, value)` — Store a fact about the patient (e.g. preferred time, allergies). Overwrites if the same key exists.
 - `recall_fact(key)` — Retrieve a specific fact by label.
 - `list_facts()` — Show all stored facts about this patient.
@@ -227,23 +238,20 @@ Today's date: {_today}.""",
             return
 
         try:
-            chat_ctx = self.session.chat_ctx
-            if not chat_ctx or not chat_ctx.messages:
-                return
+            recent = await self._db.get_recent_bookings(pid, limit=1)
+            parts = []
+            if recent:
+                b = recent[0]
+                parts.append(
+                    f"Call ended. Last booking: {b.get('event_type_slug', 'unknown')} "
+                    f"at {b.get('start_time', 'unknown')} "
+                    f"(status: {b.get('status', 'unknown')})."
+                )
+            else:
+                parts.append("Call ended. No bookings were made.")
 
-            summary_ctx = llm.ChatContext()
-            summary_ctx.add_message(
-                role="system",
-                content="Summarize this phone conversation in 2-3 sentences. Focus on what the patient needed, what was booked/cancelled/rescheduled, and any important details.",
-            )
-            for m in chat_ctx.messages:
-                summary_ctx.add_message(role=m.role, content=m.content)
-
-            llm_instance = inference.LLM(model="openai/gpt-4o")
-            stream = llm_instance.chat(chat_ctx=summary_ctx)
-            result = await stream.collect()
-            if result and result.text:
-                await self._db.add_summary(pid, result.text)
+            summary = " ".join(parts)
+            await self._db.add_summary(pid, summary)
         except Exception:
             pass
 
