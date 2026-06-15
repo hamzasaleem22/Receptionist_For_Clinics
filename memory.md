@@ -133,9 +133,7 @@ See `issue.md` and `plan/fix-permanent-memory-issues.md` for full details.
 ---
 
 ## Git Branches
-- **Memory-Successful** — feature/permanent-memory
-- **Memory-Issue-Resolved** — 5 memory bugs fixed
-- **Recptionist+Memory+Bookings+Sussfuled** — all fixes + TTS volume + human-readable timestamps + tests
+- **Recptionist+Memory+Bookings+Sussfuled** (current) — all fixes + TTS volume + human-readable timestamps + tests
 
 ---
 
