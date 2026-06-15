@@ -32,18 +32,21 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
 - **Patient Memory Tools** section in instructions (create_patient_record, remember_fact, recall_fact, list_facts, forget_fact)
 - **`on_enter()`** branches on `patient_id` for returning-vs-new greeting
 - **`on_exit()`** reads recent booking from DB and saves structured summary via `db.add_summary()` — no dependency on `session.chat_ctx` (which is cleared before on_exit fires)
+- **Volume amplification**: Cartesia volume 2.0 via `extra_kwargs` + 1.5x numpy amplification via `tts_node` override — dual-layer loudness fix
 - **Cleanup**: `ctx.add_shutdown_callback()` closes MongoDB connection on shutdown
 - Agent name in dispatch: **"Clinics Receptionist"**
 
 ### MongoDB Integration (`src/database.py`)
 - **Single database**: `voice_agent_clinic`
 - **Single collection**: `patients` — one document per patient with embedded sub-arrays:
-  - `bookings[]` — `{cal_booking_uid, event_type_slug, start_time, status, attendee_name, attendee_email, attendee_timezone, created_at, updated_at}`
+  - `bookings[]` — `{cal_booking_uid, event_type_slug, start_time, start_time_display, status, attendee_name, attendee_email, attendee_timezone, created_at, updated_at}`
   - `conversation_summaries[]` — `{summary, created_at}`
   - `memories[]` — `{key, value, created_at, updated_at}`
 - **Indexes**: `phone` (unique, sparse), `patient_id` (unique, sparse), `bookings.cal_booking_uid` (unique, partial filter)
 - **CRUD**: find/create/update patient, add/get/update bookings, add/get summaries, remember/recall/list/forget facts
 - **Duplicate-safe create_patient**: checks existing phone first → updates name → returns existing patient_id. DuplicateKeyError safety net for race conditions
+- **Human-readable timestamps**: `start_time_display` field stored alongside `start_time` for easy reading in MongoDB UI
+- **Connection timeout**: `serverSelectionTimeoutMS=30000` prevents indefinite hangs
 - All operations use `$push`, `$pull`, positional `$` on embedded arrays
 
 ### Cal.com Integration (`src/cal_tools.py`)
@@ -71,9 +74,11 @@ Build and deploy a voice receptionist agent for Alfalha Hospital using LiveKit A
 
 ---
 
-## Issues Resolved (2026-06-15)
+## Issues Resolved
 
 See `issue.md` and `plan/fix-permanent-memory-issues.md` for full details.
+
+### Memory + Caller Recognition Fixes (2026-06-15)
 
 | # | Issue | Fix |
 |---|-------|-----|
@@ -82,6 +87,13 @@ See `issue.md` and `plan/fix-permanent-memory-issues.md` for full details.
 | 3 | `conversation_summaries` always empty | `on_exit` reads recent bookings from DB instead of cleared session chat_ctx |
 | 4 | `memories` always empty | Auto-store `last_booked` fact in `create_booking()` |
 | 5 | Empty `last_name` | `create_patient()` updates existing patient fields when phone matches |
+
+### TTS Volume Fix (2026-06-15)
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 6 | Agent voice too quiet on mobile | Cartesia `volume=2.0` via `extra_kwargs` + 1.5x numpy amplification via `tts_node` override |
+| 7 | Human-unreadable timestamps in MongoDB | Added `start_time_display` field (e.g. "Monday June 15 at 08:30 AM")
 
 ---
 
@@ -122,7 +134,8 @@ See `issue.md` and `plan/fix-permanent-memory-issues.md` for full details.
 
 ## Git Branches
 - **Memory-Successful** — feature/permanent-memory
-- **Memory-Issue-Resolved** — latest: 5 memory bugs fixed
+- **Memory-Issue-Resolved** — 5 memory bugs fixed
+- **Recptionist+Memory+Bookings+Sussfuled** — all fixes + TTS volume + human-readable timestamps + tests
 
 ---
 
@@ -130,14 +143,16 @@ See `issue.md` and `plan/fix-permanent-memory-issues.md` for full details.
 
 | File | Purpose |
 |------|---------|
-| `src/agent.py` | Main voice agent (Assistant, AgentServer, preload_user_context, caller ID) |
+| `src/agent.py` | Main voice agent (Assistant, AgentServer, preload_user_context, caller ID, tts_node volume override) |
 | `src/cal_tools.py` | Cal.com API tools (booking, availability, caching, DB persistence) |
-| `src/database.py` | MongoDB async wrapper — single collection with embedded arrays |
+| `src/database.py` | MongoDB async wrapper — single collection with embedded arrays, readable timestamps |
 | `src/memory_tools.py` | PatientToolset (create_patient_record, remember/recall/list/forget facts) |
 | `src/models.py` | PatientData dataclass |
 | `start.sh` | Production launch script |
+| `tests/` | Full test suite: unit, integration, behavioral (33 tests) |
 | `issue.md` | Issue analysis — 5 problems found |
 | `plan/fix-permanent-memory-issues.md` | Fix plan + checklist |
+| `plan/fix-low-tts-volume-1.md` | TTS volume fix plan + checklist |
 | `plan/feature-permanent-memory-1.md` | Original implementation plan |
 | `.env.local` | All credentials |
 | `pyproject.toml` | Python dependencies |
@@ -145,10 +160,17 @@ See `issue.md` and `plan/fix-permanent-memory-issues.md` for full details.
 ---
 
 ## Testing
-- All 14 CRUD operations verified against live MongoDB Atlas
+- **33 automated tests** across 5 test files — run with `uv run pytest tests/`
+- **Unit tests** (6): phone normalization
+- **Volume tests** (6): numpy amplification, clipping, silence, bounds
+- **Memory tool tests** (12): all PatientToolset CRUD with mocked DB
+- **Database integration tests** (4): real MongoDB Atlas — CRUD, memory cycle, booking lifecycle, summaries
+- **Agent behavioral tests** (4): LiveKit test framework — LLM-judged greeting, returning caller, multi-turn booking
+- **Returning caller E2E verified**: SIP phone → `preload_user_context()` → greeting by name with booking/memory/summary context
 - Console mode (`--text`) — agent starts, connects to LiveKit Inference, session initializes
 - Production mode — agent registers with LiveKit Cloud (India West region)
 - Phone normalization: `+923503070436` → `923503070436`
 - Duplicate-safe patient creation verified
 - Auto-memory `last_booked` stored on booking create
 - Summary saves reliably on call end (no dependency on session state)
+- Volume amplification verified: no clipping at 1.5x, linear scaling, bounds-preserved

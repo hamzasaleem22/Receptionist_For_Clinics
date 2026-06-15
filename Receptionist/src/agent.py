@@ -1,7 +1,9 @@
 import asyncio
 import re
 from datetime import datetime, timezone
+from typing import AsyncIterable
 
+import numpy as np
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
@@ -13,10 +15,12 @@ from livekit.agents import (
     BackgroundAudioPlayer,
     BuiltinAudioClip,
     JobProcess,
+    ModelSettings,
     TurnHandlingOptions,
     inference,
     llm,
     room_io,
+    utils,
 )
 from livekit.agents.beta.tools import EndCallTool
 from livekit.plugins import ai_coustics, silero
@@ -122,6 +126,7 @@ class Assistant(Agent):
         self._patient_id = patient_id
         self._db = db
         self._preloaded_ctx = chat_ctx
+        self._volume: float = 1.5
         self._patient_tools = PatientToolset(db=db, patient_id=patient_id, cal_tools=cal_tools) if db else None
         end_call = EndCallTool()
         _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -255,6 +260,44 @@ Today's date: {_today}.""",
         except Exception:
             pass
 
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        return self._adjust_volume_in_stream(
+            Agent.default.tts_node(self, text, model_settings)
+        )
+
+    async def _adjust_volume_in_stream(
+        self, audio: AsyncIterable[rtc.AudioFrame]
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        stream: utils.audio.AudioByteStream | None = None
+        async for frame in audio:
+            if stream is None:
+                stream = utils.audio.AudioByteStream(
+                    sample_rate=frame.sample_rate,
+                    num_channels=frame.num_channels,
+                    samples_per_channel=frame.sample_rate // 10,
+                )
+            for f in stream.push(frame.data):
+                yield self._adjust_volume_in_frame(f)
+
+        if stream is not None:
+            for f in stream.flush():
+                yield self._adjust_volume_in_frame(f)
+
+    def _adjust_volume_in_frame(self, frame: rtc.AudioFrame) -> rtc.AudioFrame:
+        audio_data = np.frombuffer(frame.data, dtype=np.int16)
+        audio_float = audio_data.astype(np.float32) / np.iinfo(np.int16).max
+        audio_float = audio_float * max(0.0, min(self._volume, 5.0))
+        processed = (audio_float * np.iinfo(np.int16).max).astype(np.int16)
+
+        return rtc.AudioFrame(
+            data=processed.tobytes(),
+            sample_rate=frame.sample_rate,
+            num_channels=frame.num_channels,
+            samples_per_channel=len(processed) // frame.num_channels,
+        )
+
 
 def _prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load()
@@ -286,6 +329,7 @@ async def my_agent(ctx: agents.JobContext):
             "cartesia/sonic-3",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
             language="en",
+            extra_kwargs={"volume": 2.0},
         ),
         vad=ctx.proc.userdata["vad"],
         min_consecutive_speech_delay=0.3,

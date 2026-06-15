@@ -18,6 +18,10 @@ PATIENT_ID_DIGITS = 6
 class Database:
     def __init__(self, uri: str | None = None) -> None:
         uri = uri or os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
+        if "?" in uri:
+            uri += "&serverSelectionTimeoutMS=30000&connectTimeoutMS=15000&socketTimeoutMS=15000"
+        else:
+            uri += "?serverSelectionTimeoutMS=30000&connectTimeoutMS=15000&socketTimeoutMS=15000"
         self._client = AsyncIOMotorClient(uri)
         self._db = self._client[DB_NAME]
         self._patients = self._db[COLLECTION_NAME]
@@ -109,6 +113,7 @@ class Database:
             "cal_booking_uid": cal_booking_uid,
             "event_type_slug": event_type_slug,
             "start_time": start_time,
+            "start_time_display": start_time.strftime("%A %B %d at %I:%M %p"),
             "status": "confirmed",
             "attendee_name": attendee_name,
             "attendee_email": attendee_email,
