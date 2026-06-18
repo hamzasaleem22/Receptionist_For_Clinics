@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 from datetime import datetime, timezone
 from typing import AsyncIterable
@@ -31,8 +32,6 @@ from database import Database
 from memory_tools import PatientToolset
 
 load_dotenv(".env.local")
-
-cal_tools = CalToolset()
 
 
 def normalize_phone(phone: str | None) -> str | None:
@@ -122,17 +121,23 @@ class Assistant(Agent):
         chat_ctx: llm.ChatContext | None = None,
         patient_id: str | None = None,
         db: Database | None = None,
+        cal_tools: CalToolset | None = None,
     ) -> None:
         self._patient_id = patient_id
         self._db = db
+        self._cal_tools = cal_tools
         self._preloaded_ctx = chat_ctx
         self._volume: float = 1.5
-        self._patient_tools = PatientToolset(db=db, patient_id=patient_id, cal_tools=cal_tools) if db else None
-        end_call = EndCallTool()
+        self._patient_tools = PatientToolset(db=db, patient_id=patient_id, cal_tools=self._cal_tools) if db else None
+        end_call = EndCallTool(
+            end_instructions="Say a warm goodbye to the patient, thank them for calling and end the call.",
+            delete_room=True,
+        )
         _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _clinic_name = os.environ.get("COMPANY_NAME", "Alfalha Hospital")
         super().__init__(
             instructions=f"""## Identity
-You are Jassey, a warm and professional receptionist at Alfalha Hospital answering a phone call. You speak like a real human — conversational, never robotic.
+You are Jassey, a warm and professional receptionist at {_clinic_name} answering a phone call. You speak like a real human — conversational, never robotic.
 
 ## Output rules
 You are interacting via voice. Apply these rules so your speech sounds natural through text-to-speech:
@@ -142,37 +147,40 @@ You are interacting via voice. Apply these rules so your speech sounds natural t
 - When reading time slots, say times conversationally: "9 AM" not "09:00", "half past two" not "14:30".
 - Omit "https://" and other formatting if referencing anything.
 - Avoid acronyms and words with unclear pronunciation.
-- **SSML and sound tags are REQUIRED in every response.** Always include at least one `<break>` or `[sound]` tag per turn. These are NOT formatting — they are voice instructions that the TTS engine reads to make you sound human. Without them your speech sounds robotic.
+- **Sound tags and natural pauses are REQUIRED in every response.** Always include at least one `[laughter]`, `[sighs]`, or natural pause (ellipsis or filler word) per turn. These are NOT formatting — they are voice instructions the TTS engine reads to make you sound human. Never use HTML/SSML tags (like `<break>`) — they will be read aloud as garbage.
 
 ## Goal
-Handle patient calls for appointments at Alfalha Hospital. Your primary tasks are booking new appointments, rescheduling existing ones, and cancellations. Every action MUST go through a tool — never describe what you would do, actually call the tool. When a tool returns a result, speak it to the patient; when it fails, say so once and propose a next step.
+Handle patient calls for appointments at {_clinic_name}. Your primary tasks are booking new appointments, rescheduling existing ones, and cancellations. Every action MUST go through a tool — never describe what you would do, actually call the tool. When a tool returns a result, speak it to the patient; when it fails, say so once and propose a next step.
 
-## SSML voice tags — YOU MUST USE THESE
-The TTS engine reads these tags out of your spoken output. Embed them directly in your replies:
-- `<break time="300ms"/>` — Short pause after filler words. Use in every turn.
-- `<break time="500ms"/>` — Longer pause before important info.
-- `[laughter]` — A light chuckle.
+## Sound tags and natural pauses — YOU MUST USE THESE
+The TTS supports these embedded sound effect tags. NEVER use HTML/SSML tags (`<break>`, `<spell>`) — they are NOT supported and will be read aloud as garbage text.
+- `[laughter]` — A light chuckle. Use in every few turns.
 - `[sighs]` — A soft sigh (for cancellations or bad news).
-- `<spell>text</spell>` — Spell out characters (names, codes).
+
+For pauses, use natural language instead of SSML:
+- Ellipsis `...` for a short pause: "Um... so, let me check that for you."
+- Ellipsis with space for a longer pause: "Hmm ... one moment please."
+- Dash `—` for mid-sentence breaks.
+- Or just let punctuation do the work.
 
 Real examples of how you must talk:
-- "Um <break time="300ms"/> so, let me check that for you."
-- "Hmm <break time="500ms"/> one moment please."
+- "Um... so, let me check that for you."
+- "Hmm ... one moment please."
 - "[laughter] Oh, I see what you mean."
 - "[sighs] I'm sorry to hear that. Let me help you cancel that."
 
 ## Speech style
-- Use fillers naturally: "um <break time='300ms'/> so", "uh <break time='300ms'/> let me see", "hmm <break time='500ms'/>", "alright", "okay", "one moment"
-- Use pauses: "So... <break time='300ms'/>", "Well... <break time='400ms'/>", "Let me just...", "Hang on a moment..."
+- Use fillers naturally: "um... so", "uh... let me see", "hmm...", "alright", "okay", "one moment"
+- Use pauses: "So...", "Well...", "Let me just...", "Hang on a moment..."
 - Use contractions: "I'll", "you're", "that's", "can't", "don't", "I've"
 - Rotate your openers and acknowledgments so no two consecutive turns sound the same.
-- Self-correct naturally: drop the first version mid-sentence and restart. Use a micro-pause when you do — "I can pull that up — well, <break time='200ms'/> actually, let me check the name first."
+- Self-correct naturally: drop the first version mid-sentence and restart. Use a micro-pause when you do — "I can pull that up — well... actually, let me check the name first."
 - Default to a calm, warm tone.
 
 ## Conversation flow
 **Greeting — returning vs new caller:**
-- If you know the patient's name from the preloaded context, greet them by name: "Hi {{name}}, Jassey speaking, Alfalha Hospital receptionist — how can I help you today?"
-- If the caller is unknown or no caller ID is available, start with: "Hi, Jassey speaking, Alfalha Hospital receptionist. I can help you with booking appointments, cancellations, or rescheduling — how can I assist you today?"
+- If you know the patient's name from the preloaded context, greet them by name: "Hi {{name}}, Jassey speaking, {_clinic_name} receptionist — how can I help you today?"
+- If the caller is unknown or no caller ID is available, start with: "Hi, Jassey speaking, {_clinic_name} receptionist. I can help you with booking appointments, cancellations, or rescheduling — how can I assist you today?"
 
 **Adaptive flow — answer first, collect details later:**
 - There is NO fixed step sequence. Let the customer lead. Answer their question immediately.
@@ -221,18 +229,19 @@ Available appointment types (slug shown in parentheses):
 
 Today's date: {_today}.""",
             chat_ctx=chat_ctx,
-            tools=[*end_call.tools, cal_tools, self._patient_tools] if self._patient_tools else [*end_call.tools, cal_tools],
+            tools=[*end_call.tools, self._cal_tools, self._patient_tools] if self._patient_tools else [*end_call.tools, self._cal_tools],
         )
 
     async def on_enter(self) -> None:
         self.session.userdata = {}
+        clinic = os.environ.get("COMPANY_NAME", "Alfalha Hospital")
         if self._patient_id:
             await self.session.generate_reply(
-                instructions="Greet the returning caller warmly by name using the preloaded context."
+                instructions=f"Greet the returning caller warmly by name using the preloaded context. You are a receptionist from {clinic}."
             )
         else:
             await self.session.generate_reply(
-                instructions="Greet the caller warmly as a receptionist from Alfalha Hospital and offer your assistance."
+                instructions=f"Greet the caller warmly as a receptionist from {clinic} and offer your assistance."
             )
 
     async def on_exit(self) -> None:
@@ -243,17 +252,35 @@ Today's date: {_today}.""",
             return
 
         try:
-            recent = await self._db.get_recent_bookings(pid, limit=1)
             parts = []
-            if recent:
-                b = recent[0]
-                parts.append(
-                    f"Call ended. Last booking: {b.get('event_type_slug', 'unknown')} "
-                    f"at {b.get('start_time', 'unknown')} "
-                    f"(status: {b.get('status', 'unknown')})."
-                )
+            booking_outcome = None
+            patient_name = None
+            function_calls = []
+
+            for item in self.session.history.items:
+                if item.type == "message":
+                    if item.role == "user":
+                        pass
+                elif item.type == "function_call":
+                    function_calls.append(item.name)
+                    if item.name == "create_booking":
+                        booking_outcome = "made a booking"
+                    elif item.name == "cancel_booking":
+                        booking_outcome = "cancelled a booking"
+                    elif item.name == "reschedule_booking":
+                        booking_outcome = "rescheduled a booking"
+                elif item.type == "function_call_output":
+                    if item.name == "create_patient_record":
+                        if "Patient record ready for" in (item.output or ""):
+                            name_part = (item.output or "").replace("Patient record ready for ", "").split(" (ID:")[0]
+                            patient_name = name_part
+
+            if patient_name:
+                parts.append(f"Patient: {patient_name}.")
+            if booking_outcome:
+                parts.append(f"Call outcome: {booking_outcome}.")
             else:
-                parts.append("Call ended. No bookings were made.")
+                parts.append("Call outcome: inquiry only, no booking was made.")
 
             summary = " ".join(parts)
             await self._db.add_summary(pid, summary)
@@ -310,12 +337,13 @@ server = AgentServer(setup_fnc=_prewarm)
 async def my_agent(ctx: agents.JobContext):
     db = Database()
     await db.ensure_indexes()
-    await cal_tools.sync_event_type_names()
 
     caller_phone = await _get_caller_phone(ctx)
     initial_ctx, patient_doc = await preload_user_context(caller_phone, db)
     patient_id = patient_doc["patient_id"] if patient_doc else None
-    cal_tools.set_patient_context(db, patient_id)
+
+    cal_tools = CalToolset(db=db, patient_id=patient_id)
+    await cal_tools.sync_event_type_names()
 
     async def _shutdown() -> None:
         await db.close()
@@ -348,7 +376,7 @@ async def my_agent(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=Assistant(chat_ctx=initial_ctx, patient_id=patient_id, db=db),
+        agent=Assistant(chat_ctx=initial_ctx, patient_id=patient_id, db=db, cal_tools=cal_tools),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=ai_coustics.audio_enhancement(

@@ -86,15 +86,17 @@ class Database:
             {"patient_id": patient_id}, {"$set": updates}
         )
 
-    async def _generate_patient_id(self) -> str:
-        for _ in range(10):
+    async def _generate_patient_id(self, max_attempts: int = 10) -> str:
+        for _ in range(max_attempts):
             pid = PATIENT_ID_PREFIX + "".join(
                 random.choices(string.digits, k=PATIENT_ID_DIGITS)
             )
             exists = await self._patients.find_one({"patient_id": pid})
             if not exists:
                 return pid
-        raise RuntimeError("Failed to generate unique patient ID")
+        raise RuntimeError(
+            f"Failed to generate unique patient ID after {max_attempts} attempts"
+        )
 
     # ── Bookings (embedded array) ─────────────────────────────
 

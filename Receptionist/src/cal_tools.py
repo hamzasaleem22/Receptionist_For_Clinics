@@ -30,6 +30,8 @@ EVENT_TYPE_DISPLAY = {
 
 _slots_cache: dict[str, tuple[float, list]] = {}
 SLOTS_CACHE_TTL = 30
+_slots_cache_inserts = 0
+SLOTS_CACHE_PRUNE_INTERVAL = 10
 
 
 def _slots_cache_key(event_type_slug: str, date: str) -> str:
@@ -45,22 +47,34 @@ def _get_cached_slots(event_type_slug: str, date: str) -> list | None:
 
 
 def _set_cached_slots(event_type_slug: str, date: str, slots: list) -> None:
+    global _slots_cache_inserts
     key = _slots_cache_key(event_type_slug, date)
     _slots_cache[key] = (time.time(), slots)
+    _slots_cache_inserts += 1
+    if _slots_cache_inserts >= SLOTS_CACHE_PRUNE_INTERVAL:
+        _prune_slots_cache()
+        _slots_cache_inserts = 0
+
+
+def _prune_slots_cache() -> None:
+    now = time.time()
+    stale = [k for k, (t, _) in _slots_cache.items() if now - t > SLOTS_CACHE_TTL]
+    for k in stale:
+        del _slots_cache[k]
 
 
 class CalToolset(llm.Toolset):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        db: Database | None = None,
+        patient_id: str | None = None,
+    ) -> None:
         super().__init__(id="cal")
         api_key = os.environ.get("CAL_API_KEY")
         if not api_key:
             raise RuntimeError("CAL_API_KEY not set in environment")
         self._api_key = api_key
         self._username = os.environ.get("CAL_USERNAME", "hamzii-salim-4xxmhu")
-        self._db: Database | None = None
-        self._patient_id: str | None = None
-
-    def set_patient_context(self, db: Database, patient_id: str | None) -> None:
         self._db = db
         self._patient_id = patient_id
 
@@ -183,7 +197,7 @@ class CalToolset(llm.Toolset):
         attendee_phone: Annotated[str | None, "Phone number in international format"] = None,
         notes: Annotated[str | None, "Additional notes or reason for the visit"] = None,
     ) -> str:
-        """Book an appointment at Shifa Clinic.
+        """Book a new appointment for a patient.
 
         Args:
             event_type_slug: The slug of the event type (e.g. 'checkup', 'follow-up').
@@ -236,12 +250,10 @@ class CalToolset(llm.Toolset):
                 f"{EVENT_TYPE_DISPLAY.get(event_type_slug, event_type_slug)} on {start}",
             )
 
+        display_name = EVENT_TYPE_DISPLAY.get(event_type_slug, event_type_slug)
         return (
-            f"Appointment booked successfully!\n"
-            f"Booking UID: {uid}\n"
-            f"Start: {start}\n"
-            f"Patient: {attendee_name}\n"
-            f"Confirmation sent to {resolved_email}"
+            f"Your {display_name} on {start} has been confirmed for {attendee_name}. "
+            f"A confirmation has been sent to {resolved_email}."
         )
 
     @llm.function_tool
