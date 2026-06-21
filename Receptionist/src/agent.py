@@ -30,7 +30,14 @@ load_dotenv(".env.local")
 
 _clinic_name = os.environ.get("COMPANY_NAME", "Shifa Clinic")
 
-cal_tools = CalToolset()
+_cal_tools: CalToolset | None = None
+
+
+def get_cal_tools() -> CalToolset:
+    global _cal_tools
+    if _cal_tools is None:
+        _cal_tools = CalToolset()
+    return _cal_tools
 
 
 async def _display_tts_metrics(metrics: TTSMetrics) -> None:
@@ -161,7 +168,7 @@ Available appointment types (slug shown in parentheses):
 - **Be honest about limitations.** If you don't know something, say so — don't make it up.
 
 Today's date: {_today}.""",
-            tools=[*end_call.tools, cal_tools],
+            tools=[*end_call.tools, get_cal_tools()],
         )
 
     async def on_enter(self) -> None:
@@ -193,7 +200,7 @@ server = AgentServer(setup_fnc=_prewarm)
 
 @server.rtc_session(agent_name="Clinics Receptionist")
 async def my_agent(ctx: agents.JobContext):
-    await cal_tools.sync_event_type_names()
+    await get_cal_tools().sync_event_type_names()
 
     tts_instance = inference.TTS(
         "cartesia/sonic-3",

@@ -3,7 +3,7 @@ name = "receptionist"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "livekit-agents>=0.14",
+    "livekit-agents>=1.2",
     "livekit-plugins-silero>=0.10",
     "livekit-plugins-ai-coustics>=0.2",
     "livekit-plugins-turn-detector>=0.10",
